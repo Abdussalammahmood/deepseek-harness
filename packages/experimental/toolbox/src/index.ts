@@ -26,7 +26,7 @@ import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-skill'
 
 export const name = 'toolbox'
-export const inject = ['settings', 'tools']
+export const inject = ['settings', 'tools', 'skills']
 
 /** Settings namespace this plugin owns; the browser tab keys on the same string. */
 export const NS = 'toolbox'

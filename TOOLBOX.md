@@ -91,3 +91,17 @@ blocks the composer's send button, remembers where you drag it, and collapses to
 a small pill.
 is enabled, and the toolbox manager can disable any server from the command line
 if the GUI is unavailable.
+
+## Restoring this whole setup
+
+The companion repo carries the restore path, including the pinned MCP server
+install, the launchers, the example skill, and the settings seed:
+
+```sh
+git clone --branch feat/toolbox-ui https://github.com/Abdussalammahmood/deepseek-harness.git D:\deepseekHarnes\deepseek-harness
+git clone https://github.com/Abdussalammahmood/dsh-mcp.git D:\deepseekHarnes\mcp
+cd D:\deepseekHarnes\mcp
+setup.cmd
+```
+
+Only your API key is not in git; add it once in Settings then Models.
