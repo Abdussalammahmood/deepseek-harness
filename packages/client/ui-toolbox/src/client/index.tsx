@@ -69,6 +69,12 @@ export interface ToolboxSkill {
   source: string
   /** Owning provider. */
   provider: string
+  /** Whether model-facing catalogs currently include the skill. */
+  modelInvocable: boolean
+  /** Whether the harness can rewrite the skill's own frontmatter. */
+  switchable: boolean
+  /** Absolute path of the skill file, when known. */
+  path?: string
 }
 
 /** The `toolbox` settings section. */
@@ -252,6 +258,9 @@ export function ToolboxTab(props: { scope: ToolboxScope }) {
   const setGroup = (entryId: string, enabled: boolean): void => {
     void props.scope.set('toolGroups', groups.map(group => (group.entryId === entryId ? { ...group, enabled } : group)))
   }
+  const setSkill = (name: string, enabled: boolean): void => {
+    void props.scope.set('skills', skills.map(skill => (skill.name === name ? { ...skill, modelInvocable: enabled } : skill)))
+  }
 
   if (snapshot.status === 'loading') {
     return <div style={{ color: C.dim, fontSize: 13, padding: 12 }}>Loading toolbox…</div>
@@ -343,15 +352,26 @@ export function ToolboxTab(props: { scope: ToolboxScope }) {
 
       <Section
         title="Skills"
-        note="Installed skills. DSH exposes no per-skill switch, so this list is read-only."
+        note="Installed skills. A filesystem skill switches by setting disable-model-invocation in its own file; bundled skills are read-only."
         count={`(${skills.length})`}
       >
         <div style={{ display: 'grid', gap: 6 }}>
           {skills.map(skill => (
             <div key={skill.name} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 6, padding: '6px 10px' }}>
-              <div style={{ fontWeight: 600, fontSize: 13 }}>
-                {skill.name}{' '}
-                <span style={{ color: C.dim, fontWeight: 400, fontSize: 11 }}>{skill.source}{skill.provider !== '' ? ` · ${skill.provider}` : ''}</span>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <input
+                  type="checkbox"
+                  checked={skill.modelInvocable}
+                  disabled={!writable || !skill.switchable}
+                  title={skill.switchable ? 'include this skill in model catalogs' : 'bundled skill: read-only'}
+                  onChange={(event) => { setSkill(skill.name, event.target.checked) }}
+                />
+                <div style={{ fontWeight: 600, fontSize: 13 }}>
+                  {skill.name}{' '}
+                  <span style={{ color: C.dim, fontWeight: 400, fontSize: 11 }}>
+                    {skill.source}{skill.provider !== '' ? ` · ${skill.provider}` : ''}{skill.switchable ? '' : ' · read-only'}
+                  </span>
+                </div>
               </div>
               {skill.description !== '' && (
                 <div style={{ color: C.dim, fontSize: 12 }}>{skill.description}</div>

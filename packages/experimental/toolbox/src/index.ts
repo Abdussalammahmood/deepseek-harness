@@ -3,18 +3,19 @@
  * MCP servers, native tool providers, and skills this deployment offers, and
  * applies the user's switches.
  *
- * Two sources of truth, one writer each:
+ * Three sources of truth, one writer each:
  * - MCP servers live in the toolbox manifests; this plugin writes choices back
  *   into the same manifests the `mcp.ps1` CLI edits.
  * - Native tool providers are switched off by writing ids into the toolbox's
  *   `plugins.json`, which `mcp.ps1 patch` turns into id-targeted disable rows.
- * Either way the toolbox manager regenerates the DSH profile patch, so the
- * profile reloads live and no second patch writer exists.
+ * - A filesystem skill is switched off the way DSH itself switches one off: the
+ *   `disable-model-invocation` key in its own frontmatter, which the skill
+ *   provider's watcher picks up with no patch involved.
  *
  * @module @deepseek-ai/dsh-toolbox
  */
 
-import { readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 import z from '@deepseek-ai/schemastery'
@@ -43,6 +44,9 @@ const CONTROL_TOOLS: readonly string[] = [
  * reserved PTC transport, and disabling it would remove every tool at once.
  */
 const UNTOGGLEABLE: ReadonlySet<string> = new Set(['tools', 'toolbox', 'ui-toolbox'])
+
+/** Skill sources whose bodies this plugin must not rewrite. */
+const READ_ONLY_SOURCES: ReadonlySet<string> = new Set(['bundled'])
 
 /** One published MCP server. */
 export interface ToolboxServer {
@@ -96,6 +100,12 @@ export interface ToolboxSkill {
   source: string
   /** Provider that owns the skill body. */
   provider: string
+  /** Whether model-facing catalogs currently include the skill. */
+  modelInvocable: boolean
+  /** Whether this plugin can rewrite the skill's own frontmatter. */
+  switchable: boolean
+  /** Absolute path of the skill file, when this plugin can find it. */
+  path?: string
 }
 
 /** Plugin config, doubling as the `toolbox` settings-section shape. */
@@ -137,6 +147,9 @@ const skillSchema = z.object({
   description: z.string().default(''),
   source: z.string().default(''),
   provider: z.string().default(''),
+  modelInvocable: z.boolean().default(true),
+  switchable: z.boolean().default(false),
+  path: z.string(),
 })
 
 export const Config: z<Config> = z.object({
@@ -394,18 +407,60 @@ function writeDisabledPlugins(ids: readonly string[]): boolean {
   return true
 }
 
+/** A skill as the registry reports it, narrowed to what this plugin needs. */
+interface ListedSkill {
+  name: string
+  description: string
+  source?: string
+  provider?: string
+  invocation?: { modelInvocable?: boolean }
+  resourceBase?: { kind?: string; path?: string; url?: string; description?: string }
+}
+
 /** The skill registry surface this plugin reads. */
 interface SkillListable {
-  list: (options?: object) => Promise<readonly {
-    name: string
-    description: string
-    source?: string
-    provider?: string
-  }[]>
+  list: (options?: object) => Promise<readonly ListedSkill[]>
 }
 
 /**
- * Every installed skill.
+ * Locate the file backing one skill, when it is a filesystem skill.
+ * @param skill - the listed skill.
+ * @returns the absolute SKILL.md or flat skill path, or undefined.
+ */
+function skillFile(skill: ListedSkill): string | undefined {
+  const base = skill.resourceBase
+  if (base === undefined || base.kind !== 'directory' || typeof base.path !== 'string') return undefined
+  const bundle = join(base.path, 'SKILL.md')
+  if (existsSync(bundle)) return bundle
+  const flat = join(base.path, `${skill.name}.md`)
+  if (existsSync(flat)) return flat
+  return undefined
+}
+
+/**
+ * Flip one skill's model visibility the way DSH reads it: the
+ * `disable-model-invocation` key in the skill's own frontmatter.
+ * @param file - absolute skill file.
+ * @param invocable - whether model-facing catalogs should include it.
+ * @returns whether the file changed.
+ */
+export function setModelInvocable(file: string, invocable: boolean): boolean {
+  const text = readFileSync(file, 'utf8')
+  const front = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text)
+  if (front === null || front[1] === undefined) return false
+  const current = front[1]
+  const line = `disable-model-invocation: ${invocable ? 'false' : 'true'}`
+  const body = /^disable-model-invocation:.*$/m.test(current)
+    ? current.replace(/^disable-model-invocation:.*$/m, line)
+    : `${current}\n${line}`
+  const next = `${text.slice(0, front.index)}---\n${body}\n---${text.slice(front.index + front[0].length)}`
+  if (next === text) return false
+  writeFileSync(file, next, 'utf8')
+  return true
+}
+
+/**
+ * Every installed skill, with the switch state and the file this plugin may edit.
  * @param ctx - host plugin context.
  * @returns skills in registry order, or an empty list without the service.
  */
@@ -414,18 +469,26 @@ export async function discoverSkills(ctx: Context): Promise<ToolboxSkill[]> {
   if (skills === undefined || typeof skills.list !== 'function') return []
   try {
     const listed = await skills.list({})
-    return listed.map(skill => ({
-      name: skill.name,
-      description: skill.description,
-      source: skill.source ?? '',
-      provider: skill.provider ?? '',
-    }))
+    return listed.map((skill) => {
+      const path = skillFile(skill)
+      const source = skill.source ?? ''
+      const switchable = path !== undefined && !READ_ONLY_SOURCES.has(source)
+      return {
+        name: skill.name,
+        description: skill.description,
+        source,
+        provider: skill.provider ?? '',
+        modelInvocable: skill.invocation?.modelInvocable !== false,
+        switchable,
+        ...path === undefined || !switchable ? {} : { path },
+      }
+    })
   } catch {
     return []
   }
 }
 
-/** Comparable form of the server switches, for change detection. */
+/** Comparable form of the MCP server switches, for change detection. */
 function serverSignature(servers: readonly ToolboxServer[]): string {
   return JSON.stringify(servers
     .map(server => ({ id: server.id, enabled: server.enabled, hidden: [...server.hiddenTools].sort() }))
@@ -438,6 +501,14 @@ function groupSignature(groups: readonly ToolboxToolGroup[]): string {
     .filter(group => group.entryId !== undefined)
     .map(group => ({ id: group.entryId, enabled: group.enabled }))
     .sort((a, b) => String(a.id).localeCompare(String(b.id))))
+}
+
+/** Comparable form of the skill switches, for change detection. */
+function skillSignature(skills: readonly ToolboxSkill[]): string {
+  return JSON.stringify(skills
+    .filter(skill => skill.switchable)
+    .map(skill => ({ name: skill.name, on: skill.modelInvocable }))
+    .sort((a, b) => a.name.localeCompare(b.name)))
 }
 
 /** Write chosen enablement and hidden tools into the MCP manifests. */
@@ -458,6 +529,23 @@ function applyServers(servers: readonly ToolboxServer[]): void {
 }
 
 /**
+ * Flip the frontmatter of every switchable skill whose state the user changed.
+ * No patch is regenerated: the skill provider watches its roots.
+ * @param skills - the desired skill switches.
+ * @param log - diagnostic sink.
+ */
+function applySkills(skills: readonly ToolboxSkill[], log: (message: string) => void): void {
+  for (const skill of skills) {
+    if (!skill.switchable || skill.path === undefined) continue
+    try {
+      setModelInvocable(skill.path, skill.modelInvocable)
+    } catch (error) {
+      log(`toolbox: could not update skill "${skill.name}": ${String(error)}`)
+    }
+  }
+}
+
+/**
  * Register the `toolbox` settings namespace.
  * @param ctx - host plugin context.
  * @param config - composition config; its published lists are replaced by live discovery.
@@ -470,6 +558,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
 
   let appliedServers = serverSignature(servers)
   let appliedGroups = groupSignature(toolGroups)
+  let appliedSkills = skillSignature(skills)
   let current: () => Config = () => defaults
 
   ctx.inject(['settings'], (settingsCtx) => {
@@ -483,13 +572,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       },
       onChange: () => {
         const next = current()
-        let changed = false
+        let patchNeeded = false
         try {
           const serverNext = serverSignature(next.servers)
           if (serverNext !== appliedServers) {
             appliedServers = serverNext
             applyServers(next.servers)
-            changed = true
+            patchNeeded = true
           }
           const groupNext = groupSignature(next.toolGroups)
           if (groupNext !== appliedGroups) {
@@ -497,9 +586,14 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
             const off = next.toolGroups
               .filter(group => !group.enabled && group.entryId !== undefined)
               .map(group => group.entryId as string)
-            if (writeDisabledPlugins(off)) changed = true
+            if (writeDisabledPlugins(off)) patchNeeded = true
           }
-          if (changed) regeneratePatch((message) => { ctx.logger.info(message) })
+          const skillNext = skillSignature(next.skills)
+          if (skillNext !== appliedSkills) {
+            appliedSkills = skillNext
+            applySkills(next.skills, (message) => { ctx.logger.info(message) })
+          }
+          if (patchNeeded) regeneratePatch((message) => { ctx.logger.info(message) })
         } catch (error) {
           ctx.logger.error(`toolbox: failed to apply settings: ${String(error)}`)
         }
