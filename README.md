@@ -73,3 +73,23 @@ For agents, follow [AGENTS.md](AGENTS.md).
 [MIT](LICENSE)
 
 Third-party dependencies and their licenses are disclosed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+
+## This fork: the Toolbox setup
+
+`feat/toolbox-ui` is a deployment fork. It adds an isolated **Toolbox** panel -
+MCP servers, native tools, and skills, each with on/off switches, plus a
+draggable control-warning HUD - and a model-facing `toolbox` tool. All of it
+lives in two new packages; see [TOOLBOX.md](TOOLBOX.md).
+
+The MCP servers, the launchers, and the example skill live in a companion repo.
+Restore the whole setup on a new machine with:
+
+```sh
+git clone --branch feat/toolbox-ui https://github.com/Abdussalammahmood/deepseek-harness.git D:\deepseekHarnes\deepseek-harness
+git clone https://github.com/Abdussalammahmood/dsh-mcp.git D:\deepseekHarnes\mcp
+cd D:\deepseekHarnes\mcp
+setup.cmd
+```
+
+Only your API key is not in git; add it once in Settings then Models.

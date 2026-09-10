@@ -94,3 +94,21 @@ pnpm dsh web
 [MIT](LICENSE)
 
 第三方依赖及其许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+
+## 本分支：Toolbox 设置
+
+`feat/toolbox-ui` 是本部署使用的分支，新增了一个独立的 **Toolbox** 面板——
+MCP 服务器、原生工具与技能均可单独开关，并带有可拖动的控制能力告警悬浮窗——
+以及一个面向模型的 `toolbox` 工具。全部代码位于两个新包中，详见 [TOOLBOX.md](TOOLBOX.md)。
+
+MCP 服务器、启动脚本与示例技能存放在配套仓库中。在新机器上完整还原：
+
+```sh
+git clone --branch feat/toolbox-ui https://github.com/Abdussalammahmood/deepseek-harness.git D:\deepseekHarnes\deepseek-harness
+git clone https://github.com/Abdussalammahmood/dsh-mcp.git D:\deepseekHarnes\mcp
+cd D:\deepseekHarnes\mcp
+setup.cmd
+```
+
+只有 API 密钥不在 git 中，首次使用时在 设置 → 模型 中填写一次即可。
