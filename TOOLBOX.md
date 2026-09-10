@@ -105,3 +105,10 @@ setup.cmd
 ```
 
 Only your API key is not in git; add it once in Settings then Models.
+
+## Where the conversations and workspaces live
+
+Sessions are stored per workspace under `%DSH_HOME%\sessions\`, indexed by
+`%DSH_HOME%\storages\workspace.json` (workspace id, path, title, session ids).
+A private git backup of that store, plus a daily scheduled task, is set up by the
+companion repo: see its README section "Where your conversations live".
