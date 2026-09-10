@@ -1,13 +1,15 @@
 /**
  * Toolbox host half: owns the `toolbox` settings namespace that describes the
- * MCP servers, native tools, and skills this deployment offers, and writes the
- * user's server/tool choices back into the MCP toolbox manifests.
+ * MCP servers, native tool providers, and skills this deployment offers, and
+ * applies the user's switches.
  *
- * The toolbox folder stays the single source of truth for MCP servers. This
- * plugin reads the manifests to publish their servers, tools, and descriptions
- * to the browser UI, and on a settings change it updates the same manifests and
- * asks the toolbox manager (`mcp.ps1 patch`) to regenerate the DSH profile
- * patch, so the profile reloads live and no second patch writer exists.
+ * Two sources of truth, one writer each:
+ * - MCP servers live in the toolbox manifests; this plugin writes choices back
+ *   into the same manifests the `mcp.ps1` CLI edits.
+ * - Native tool providers are switched off by writing ids into the toolbox's
+ *   `plugins.json`, which `mcp.ps1 patch` turns into id-targeted disable rows.
+ * Either way the toolbox manager regenerates the DSH profile patch, so the
+ * profile reloads live and no second patch writer exists.
  *
  * @module @deepseek-ai/dsh-toolbox
  */
@@ -36,6 +38,12 @@ const CONTROL_TOOLS: readonly string[] = [
   'PowerShell', 'FileSystem', 'Registry', 'Process', 'Clipboard', 'MultiSelect', 'MultiEdit',
 ]
 
+/**
+ * Entry ids the UI must never switch off: the tool registry itself owns the
+ * reserved PTC transport, and disabling it would remove every tool at once.
+ */
+const UNTOGGLEABLE: ReadonlySet<string> = new Set(['tools', 'toolbox', 'ui-toolbox'])
+
 /** One published MCP server. */
 export interface ToolboxServer {
   /** Manifest id, stable across edits. */
@@ -58,12 +66,24 @@ export interface ToolboxServer {
   hiddenTools: string[]
 }
 
-/** One native (non-MCP) model-facing tool. */
+/** One model-facing tool. */
 export interface ToolboxTool {
   /** Model-visible tool name. */
   name: string
   /** Description the model sees. */
   description: string
+}
+
+/** Native tools grouped by the plugin that contributes them. */
+export interface ToolboxToolGroup {
+  /** npm package that contributes the tools, or `(other)` for unidentified ones. */
+  plugin: string
+  /** Loader entry id that can be switched off, absent when unidentified. */
+  entryId?: string
+  /** The tools this provider contributes. */
+  tools: ToolboxTool[]
+  /** Whether the provider is currently on. */
+  enabled: boolean
 }
 
 /** One installed skill. */
@@ -82,8 +102,8 @@ export interface ToolboxSkill {
 export interface Config {
   /** Published MCP servers, defaulted from the toolbox manifests. */
   servers: ToolboxServer[]
-  /** Native model-facing tools, defaulted from the live tool registry. */
-  nativeTools: ToolboxTool[]
+  /** Native tools grouped by provider, defaulted from the registry plus the shipped catalogs. */
+  toolGroups: ToolboxToolGroup[]
   /** Installed skills, defaulted from the live skill registry. */
   skills: ToolboxSkill[]
 }
@@ -105,6 +125,13 @@ const toolSchema = z.object({
   description: z.string().default(''),
 })
 
+const toolGroupSchema = z.object({
+  plugin: z.string().required(),
+  entryId: z.string(),
+  tools: z.array(toolSchema).default([]),
+  enabled: z.boolean().default(true),
+})
+
 const skillSchema = z.object({
   name: z.string().required(),
   description: z.string().default(''),
@@ -114,7 +141,7 @@ const skillSchema = z.object({
 
 export const Config: z<Config> = z.object({
   servers: z.array(serverSchema).default([]),
-  nativeTools: z.array(toolSchema).default([]),
+  toolGroups: z.array(toolGroupSchema).default([]),
   skills: z.array(skillSchema).default([]),
 })
 
@@ -129,13 +156,43 @@ interface Manifest {
   toolFilter?: { style?: string; envVar?: string; excluded?: string[] }
 }
 
+/** The subset of `plugins.json` this plugin reads and writes. */
+interface PluginsDoc {
+  harnessRoot?: string
+  plugins?: unknown[]
+  disabledPlugins?: string[]
+}
+
 /** Toolbox folder; overridable for tests or a relocated toolbox. */
 export function toolboxRoot(): string {
   return process.env.DSH_TOOLBOX_ROOT ?? 'D:\\deepseekHarnes\\mcp'
 }
 
+/** Harness checkout the catalogs are read from. */
+export function harnessRoot(): string {
+  if (process.env.DSH_HARNESS_ROOT !== undefined) return process.env.DSH_HARNESS_ROOT
+  try {
+    const doc = JSON.parse(readFileSync(join(toolboxRoot(), 'plugins.json'), 'utf8')) as PluginsDoc
+    if (typeof doc.harnessRoot === 'string' && doc.harnessRoot !== '') return doc.harnessRoot
+  } catch { /* fall through to the default */ }
+  return 'D:\\deepseekHarnes\\deepseek-harness'
+}
+
 /** Absolute manifest path per server id, filled by {@link discover}. */
 const manifestPathById = new Map<string, string>()
+
+/** Run the one patch generator, so this plugin never writes the DSH patch itself. */
+function regeneratePatch(log: (message: string) => void): void {
+  const script = join(toolboxRoot(), 'mcp.ps1')
+  const child = spawn(
+    'powershell',
+    ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, 'patch'],
+    { stdio: 'ignore', windowsHide: true },
+  )
+  child.on('error', (error: unknown) => {
+    log(`toolbox: settings applied but the DSH patch was not regenerated: ${String(error)}`)
+  })
+}
 
 /**
  * Read every manifest and publish it as a server entry.
@@ -200,6 +257,143 @@ export function discoverTools(ctx: Context): ToolboxTool[] {
   }
 }
 
+/**
+ * Map each shipped tool package to the model-visible names it contributes,
+ * read from the generated tool catalog the repository verifies in CI.
+ * @param root - harness checkout root.
+ * @returns package to tool names.
+ */
+export function readCatalogMap(root: string): Map<string, string[]> {
+  const map = new Map<string, string[]>()
+  let text: string
+  try {
+    text = readFileSync(join(root, 'docs', 'tool-catalog.md'), 'utf8')
+  } catch {
+    return map
+  }
+  for (const raw of text.split('\n')) {
+    const line = raw.trim()
+    if (!line.startsWith('|')) continue
+    const cells = line.split('|').map(cell => cell.trim())
+    if (cells.length < 4) continue
+    const pkgCell = cells[1]
+    const namesCell = cells[2]
+    if (pkgCell === undefined || namesCell === undefined) continue
+    const pkg = pkgCell.replace(/`/g, '')
+    if (!pkg.startsWith('@')) continue
+    const names = [...namesCell.matchAll(/`([^`]+)`/g)]
+      .flatMap(match => (match[1] === undefined ? [] : [match[1]]))
+    if (names.length > 0) map.set(pkg, names)
+  }
+  return map
+}
+
+/**
+ * Map each shipped package to its loader entry id, read from the shipped bundle
+ * patches, so a switch can name the row it disables.
+ * @param root - harness checkout root.
+ * @returns package name to loader entry id.
+ */
+export function readEntryIds(root: string): Map<string, string> {
+  const map = new Map<string, string>()
+  const bundles = join(root, 'packages', 'bundle')
+  let dirs: string[]
+  try {
+    dirs = readdirSync(bundles)
+  } catch {
+    return map
+  }
+  for (const dir of dirs) {
+    let text: string
+    try {
+      text = readFileSync(join(bundles, dir, 'cordis.patch.yml'), 'utf8')
+    } catch {
+      continue
+    }
+    const re = /-\s*id:\s*(\S+)\s*\r?\n\s*name:\s*'?([^'\r\n]+)'?/g
+    let match = re.exec(text)
+    while (match !== null) {
+      const id = match[1]
+      const name = match[2]
+      if (id !== undefined && name !== undefined) map.set(name.trim(), id)
+      match = re.exec(text)
+    }
+  }
+  return map
+}
+
+/**
+ * Group the live native tools by the plugin that contributes them, so each
+ * group can carry one switch.
+ * @param ctx - host plugin context.
+ * @returns groups in package order, with an `(other)` group for unidentified tools.
+ */
+export function discoverToolGroups(ctx: Context): ToolboxToolGroup[] {
+  const tools = discoverTools(ctx)
+  if (tools.length === 0) return []
+  const root = harnessRoot()
+  const catalog = readCatalogMap(root)
+  const entryIds = readEntryIds(root)
+  const disabled = new Set(readPluginsDoc().disabledPlugins ?? [])
+
+  const packageForTool = new Map<string, string>()
+  for (const [pkg, names] of catalog) {
+    for (const name of names) packageForTool.set(name, pkg)
+  }
+
+  const grouped = new Map<string, ToolboxTool[]>()
+  const other: ToolboxTool[] = []
+  for (const tool of tools) {
+    const pkg = packageForTool.get(tool.name)
+    if (pkg === undefined) {
+      other.push(tool)
+      continue
+    }
+    const list = grouped.get(pkg) ?? []
+    list.push(tool)
+    grouped.set(pkg, list)
+  }
+
+  const groups: ToolboxToolGroup[] = []
+  for (const [pkg, list] of [...grouped].sort((a, b) => a[0].localeCompare(b[0]))) {
+    const entryId = entryIds.get(pkg)
+    if (entryId !== undefined && UNTOGGLEABLE.has(entryId)) continue
+    groups.push({
+      plugin: pkg,
+      ...entryId === undefined ? {} : { entryId },
+      tools: list,
+      enabled: entryId === undefined ? true : !disabled.has(entryId),
+    })
+  }
+  if (other.length > 0) groups.push({ plugin: '(other)', tools: other, enabled: true })
+  return groups
+}
+
+/** Read the toolbox plugin document. */
+function readPluginsDoc(): PluginsDoc {
+  try {
+    return JSON.parse(readFileSync(join(toolboxRoot(), 'plugins.json'), 'utf8')) as PluginsDoc
+  } catch {
+    return {}
+  }
+}
+
+/**
+ * Record the switched-off provider entry ids, in the document `mcp.ps1` reads.
+ * @param ids - loader entry ids to disable.
+ * @returns whether the document changed.
+ */
+function writeDisabledPlugins(ids: readonly string[]): boolean {
+  const path = join(toolboxRoot(), 'plugins.json')
+  const doc = readPluginsDoc()
+  const next = [...ids].sort()
+  const before = [...doc.disabledPlugins ?? []].sort()
+  if (before.length === next.length && before.every((id, index) => id === next[index])) return false
+  doc.disabledPlugins = next
+  writeFileSync(path, `${JSON.stringify(doc, null, 2)}\n`, 'utf8')
+  return true
+}
+
 /** The skill registry surface this plugin reads. */
 interface SkillListable {
   list: (options?: object) => Promise<readonly {
@@ -231,18 +425,23 @@ export async function discoverSkills(ctx: Context): Promise<ToolboxSkill[]> {
   }
 }
 
-/** Comparable form of the fields this plugin owns, for change detection. */
-function signature(servers: readonly ToolboxServer[]): string {
+/** Comparable form of the server switches, for change detection. */
+function serverSignature(servers: readonly ToolboxServer[]): string {
   return JSON.stringify(servers
     .map(server => ({ id: server.id, enabled: server.enabled, hidden: [...server.hiddenTools].sort() }))
     .sort((a, b) => a.id.localeCompare(b.id)))
 }
 
-/**
- * Write chosen enablement and hidden tools into the manifests, then let the
- * toolbox manager regenerate the DSH patch (one patch writer, live reload).
- */
-function applyToManifests(servers: readonly ToolboxServer[], log: (message: string) => void): void {
+/** Comparable form of the provider switches, for change detection. */
+function groupSignature(groups: readonly ToolboxToolGroup[]): string {
+  return JSON.stringify(groups
+    .filter(group => group.entryId !== undefined)
+    .map(group => ({ id: group.entryId, enabled: group.enabled }))
+    .sort((a, b) => String(a.id).localeCompare(String(b.id))))
+}
+
+/** Write chosen enablement and hidden tools into the MCP manifests. */
+function applyServers(servers: readonly ToolboxServer[]): void {
   for (const server of servers) {
     const path = manifestPathById.get(server.id)
     if (path === undefined) continue
@@ -256,15 +455,6 @@ function applyToManifests(servers: readonly ToolboxServer[], log: (message: stri
     if (manifest.toolFilter !== undefined) manifest.toolFilter.excluded = [...server.hiddenTools]
     writeFileSync(path, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8')
   }
-  const script = join(toolboxRoot(), 'mcp.ps1')
-  const child = spawn(
-    'powershell',
-    ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, 'patch'],
-    { stdio: 'ignore', windowsHide: true },
-  )
-  child.on('error', (error: unknown) => {
-    log(`toolbox: manifest updated but the DSH patch was not regenerated: ${String(error)}`)
-  })
 }
 
 /**
@@ -273,30 +463,43 @@ function applyToManifests(servers: readonly ToolboxServer[], log: (message: stri
  * @param config - composition config; its published lists are replaced by live discovery.
  */
 export async function apply(ctx: Context, config: Config): Promise<void> {
-  const discovered = discover()
-  const nativeTools = discoverTools(ctx)
+  const servers = discover()
+  const toolGroups = discoverToolGroups(ctx)
   const skills = await discoverSkills(ctx)
-  const defaults: Config = { servers: discovered, nativeTools, skills }
-  let applied = signature(discovered)
+  const defaults: Config = { servers, toolGroups, skills }
+
+  let appliedServers = serverSignature(servers)
+  let appliedGroups = groupSignature(toolGroups)
   let current: () => Config = () => defaults
 
   ctx.inject(['settings'], (settingsCtx) => {
-    const composition: Config = {
-      servers: defaults.servers.length > 0 ? defaults.servers : config.servers,
-      nativeTools: defaults.nativeTools,
-      skills: defaults.skills,
-    }
-    settingsCtx.settings.installSection(ctx, NS, Config, composition, {
+    settingsCtx.settings.installSection(ctx, NS, Config, {
+      servers: servers.length > 0 ? servers : config.servers,
+      toolGroups: toolGroups.length > 0 ? toolGroups : config.toolGroups,
+      skills: skills.length > 0 ? skills : config.skills,
+    }, {
       setSource: (source) => {
         current = source
       },
       onChange: () => {
-        const servers = current().servers
-        const next = signature(servers)
-        if (next === applied) return
-        applied = next
+        const next = current()
+        let changed = false
         try {
-          applyToManifests(servers, (message) => { ctx.logger.info(message) })
+          const serverNext = serverSignature(next.servers)
+          if (serverNext !== appliedServers) {
+            appliedServers = serverNext
+            applyServers(next.servers)
+            changed = true
+          }
+          const groupNext = groupSignature(next.toolGroups)
+          if (groupNext !== appliedGroups) {
+            appliedGroups = groupNext
+            const off = next.toolGroups
+              .filter(group => !group.enabled && group.entryId !== undefined)
+              .map(group => group.entryId as string)
+            if (writeDisabledPlugins(off)) changed = true
+          }
+          if (changed) regeneratePatch((message) => { ctx.logger.info(message) })
         } catch (error) {
           ctx.logger.error(`toolbox: failed to apply settings: ${String(error)}`)
         }

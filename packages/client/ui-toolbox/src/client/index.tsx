@@ -2,12 +2,13 @@
  * Toolbox tab and control warning overlay for the Web client.
  *
  * The tab lists every MCP server (with its tools and per-tool switches), every
- * native tool, and every installed skill. The overlay is a small always-visible
+ * native tool grouped by the plugin that provides it (with a switch per
+ * provider), and every installed skill. The overlay is a small always-visible
  * window that appears only while a machine-controlling capability is enabled.
  *
  * Both read and write the `toolbox` settings namespace owned by
- * `@deepseek-ai/dsh-toolbox`. The host half writes the same MCP toolbox
- * manifests, so this UI and the `mcp.ps1` CLI stay one source of truth.
+ * `@deepseek-ai/dsh-toolbox`, whose host half applies the choices through the
+ * same files the `mcp.ps1` CLI edits.
  */
 
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
@@ -38,12 +39,24 @@ export interface ToolboxServer {
   hiddenTools: string[]
 }
 
-/** One native model-facing tool. */
+/** One model-facing tool. */
 export interface ToolboxTool {
   /** Model-visible name. */
   name: string
   /** Model-visible description. */
   description: string
+}
+
+/** Native tools grouped by the plugin that contributes them. */
+export interface ToolboxToolGroup {
+  /** Contributing package, or `(other)`. */
+  plugin: string
+  /** Loader entry id that the switch disables, absent when unidentified. */
+  entryId?: string
+  /** The tools this provider contributes. */
+  tools: ToolboxTool[]
+  /** Whether the provider is on. */
+  enabled: boolean
 }
 
 /** One installed skill. */
@@ -62,8 +75,8 @@ export interface ToolboxSkill {
 export interface ToolboxSettings {
   /** Published MCP servers. */
   servers: ToolboxServer[]
-  /** Native tools. */
-  nativeTools: ToolboxTool[]
+  /** Native tools grouped by provider. */
+  toolGroups: ToolboxToolGroup[]
   /** Installed skills. */
   skills: ToolboxSkill[]
 }
@@ -102,7 +115,7 @@ function useScope(scope: ToolboxScope): ReturnType<ToolboxScope['getSnapshot']> 
   return snapshot
 }
 
-/** The servers that are enabled and able to control this machine. */
+/** The enabled servers that can control this machine. */
 function dangerousServers(settings: ToolboxSettings | undefined): ToolboxServer[] {
   return (settings?.servers ?? []).filter(server => server.enabled && server.risk === 'control')
 }
@@ -157,30 +170,87 @@ function Section(props: { title: string; note: string; count: string; children: 
   )
 }
 
+/** One native-tool provider with its switch. */
+function ToolGroupCard(props: {
+  group: ToolboxToolGroup
+  writable: boolean
+  open: boolean
+  onToggleOpen: () => void
+  onToggle: (enabled: boolean) => void
+}) {
+  const { group, writable, open, onToggleOpen, onToggle } = props
+  const switchable = group.entryId !== undefined
+  return (
+    <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 6, padding: 10 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <input
+          type="checkbox"
+          checked={group.enabled}
+          disabled={!writable || !switchable}
+          title={switchable ? `switch ${group.plugin} off` : 'this provider cannot be switched off individually'}
+          onChange={(event) => { onToggle(event.target.checked) }}
+        />
+        <div style={{ flex: 1 }}>
+          <div style={{ fontWeight: 600, fontSize: 13 }}>
+            {group.plugin}{' '}
+            <span style={{ color: C.dim, fontWeight: 400, fontSize: 11 }}>
+              {group.tools.length} tool{group.tools.length === 1 ? '' : 's'}
+              {switchable ? ` · entry ${group.entryId}` : ' · not switchable'}
+            </span>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={onToggleOpen}
+          style={{ background: 'transparent', border: `1px solid ${C.border}`, color: C.text, borderRadius: 4, padding: '2px 8px', cursor: 'pointer', fontSize: 12 }}
+        >
+          {open ? 'Hide' : 'Tools'}
+        </button>
+      </div>
+      {open && (
+        <div style={{ marginTop: 8, borderTop: `1px solid ${C.border}`, paddingTop: 6 }}>
+          {group.tools.map(tool => (
+            <div key={tool.name} style={{ padding: '3px 0' }}>
+              <div style={{ fontSize: 13, color: group.enabled ? C.text : C.off }}>{tool.name}</div>
+              {tool.description !== '' && (
+                <div style={{ color: C.dim, fontSize: 12 }}>{tool.description.slice(0, 200)}{tool.description.length > 200 ? '…' : ''}</div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 /** The Toolbox tab body. */
 export function ToolboxTab(props: { scope: ToolboxScope }) {
   const snapshot = useScope(props.scope)
   const [expanded, setExpanded] = useState<string | undefined>(undefined)
-  const [showTools, setShowTools] = useState(false)
+  const [openGroup, setOpenGroup] = useState<string | undefined>(undefined)
 
   const servers = snapshot.value?.servers ?? []
-  const nativeTools = snapshot.value?.nativeTools ?? []
+  const groups = snapshot.value?.toolGroups ?? []
   const skills = snapshot.value?.skills ?? []
   const writable = snapshot.writable
   const dangerous = dangerousServers(snapshot.value)
+  const toolCount = groups.reduce((total, group) => total + group.tools.length, 0)
 
-  const write = (next: ToolboxServer[]): void => { void props.scope.set('servers', next) }
+  const writeServers = (next: ToolboxServer[]): void => { void props.scope.set('servers', next) }
   const setEnabled = (id: string, enabled: boolean): void => {
-    write(servers.map(server => (server.id === id ? { ...server, enabled } : server)))
+    writeServers(servers.map(server => (server.id === id ? { ...server, enabled } : server)))
   }
   const setTool = (id: string, tool: string, enabled: boolean): void => {
-    write(servers.map((server) => {
+    writeServers(servers.map((server) => {
       if (server.id !== id) return server
       const hidden = new Set(server.hiddenTools)
       if (enabled) hidden.delete(tool)
       else hidden.add(tool)
       return { ...server, hiddenTools: [...hidden] }
     }))
+  }
+  const setGroup = (entryId: string, enabled: boolean): void => {
+    void props.scope.set('toolGroups', groups.map(group => (group.entryId === entryId ? { ...group, enabled } : group)))
   }
 
   if (snapshot.status === 'loading') {
@@ -195,7 +265,7 @@ export function ToolboxTab(props: { scope: ToolboxScope }) {
       <strong>Toolbox</strong>
       <span style={{ color: C.dim, fontSize: 12, marginLeft: 10 }}>
         {servers.filter(server => server.enabled).length}/{servers.length} MCP servers ·{' '}
-        {nativeTools.length} native tools · {skills.length} skills
+        {toolCount} native tools · {skills.length} skills
       </span>
 
       {dangerous.length > 0 && (
@@ -253,33 +323,27 @@ export function ToolboxTab(props: { scope: ToolboxScope }) {
 
       <Section
         title="Native tools"
-        note="Built into the harness. Names and descriptions are read from the live tool registry."
-        count={`(${nativeTools.length})`}
+        note="Built into the harness, grouped by the plugin that provides them. Switching a provider off disables that plugin's tool row and applies immediately."
+        count={`(${toolCount})`}
       >
-        <button
-          type="button"
-          onClick={() => { setShowTools(!showTools) }}
-          style={{ background: 'transparent', border: `1px solid ${C.border}`, color: C.text, borderRadius: 4, padding: '3px 8px', cursor: 'pointer', fontSize: 12 }}
-        >
-          {showTools ? 'Hide list' : 'Show list'}
-        </button>
-        {showTools && (
-          <div style={{ marginTop: 8, display: 'grid', gap: 6 }}>
-            {nativeTools.map(tool => (
-              <div key={tool.name} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 6, padding: '6px 10px' }}>
-                <div style={{ fontWeight: 600, fontSize: 13 }}>{tool.name}</div>
-                {tool.description !== '' && (
-                  <div style={{ color: C.dim, fontSize: 12 }}>{tool.description.slice(0, 220)}{tool.description.length > 220 ? '…' : ''}</div>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
+        <div style={{ display: 'grid', gap: 10 }}>
+          {groups.map(group => (
+            <ToolGroupCard
+              key={group.plugin}
+              group={group}
+              writable={writable}
+              open={openGroup === group.plugin}
+              onToggleOpen={() => { setOpenGroup(openGroup === group.plugin ? undefined : group.plugin) }}
+              onToggle={(enabled) => { if (group.entryId !== undefined) setGroup(group.entryId, enabled) }}
+            />
+          ))}
+          {groups.length === 0 && <div style={{ color: C.dim, fontSize: 13 }}>No native tools reported.</div>}
+        </div>
       </Section>
 
       <Section
         title="Skills"
-        note="Installed skills the model or the user can invoke."
+        note="Installed skills. DSH exposes no per-skill switch, so this list is read-only."
         count={`(${skills.length})`}
       >
         <div style={{ display: 'grid', gap: 6 }}>
