@@ -15,7 +15,7 @@ import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 /** One published MCP server, mirroring the host half's payload. */
 export interface ToolboxServer {
@@ -100,6 +100,9 @@ export interface ToolboxScope {
 
 /** Services this browser plugin needs. */
 export const inject = ['slots', 'settingsScope']
+
+const OVERLAY_KEY = 'dsh-toolbox-overlay-position-v1'
+const OVERLAY_COLLAPSED_KEY = 'dsh-toolbox-overlay-collapsed-v1'
 
 const C = {
   panel: '#0f1420',
@@ -389,42 +392,115 @@ export function ToolboxTab(props: { scope: ToolboxScope }) {
  * Always-visible control warning: a small floating window that appears only
  * while a machine-controlling capability is enabled.
  */
+/**
+ * Always-visible control warning, as a draggable heads-up display.
+ *
+ * It defaults to the TOP-right so it never covers the composer's send/stop
+ * button, remembers wherever the user drags it, and collapses to a small pill.
+ */
 export function ControlOverlay(props: { scope: ToolboxScope }) {
   const snapshot = useScope(props.scope)
+  const [pos, setPos] = useState<{ x: number; y: number } | undefined>(() => {
+    try {
+      const raw = window.localStorage.getItem(OVERLAY_KEY)
+      if (raw !== null) {
+        const parsed = JSON.parse(raw) as { x?: unknown; y?: unknown }
+        if (typeof parsed.x === 'number' && typeof parsed.y === 'number') return { x: parsed.x, y: parsed.y }
+      }
+    } catch { /* an unreadable preference just means the default position */ }
+    return undefined
+  })
+  const [collapsed, setCollapsed] = useState<boolean>(() => {
+    try { return window.localStorage.getItem(OVERLAY_COLLAPSED_KEY) === '1' } catch { return false }
+  })
+  const drag = useRef<{ dx: number; dy: number } | undefined>(undefined)
+
   const dangerous = dangerousServers(snapshot.value)
   if (dangerous.length === 0) return null
+
+  const persist = (next: { x: number; y: number } | undefined): void => {
+    try { window.localStorage.setItem(OVERLAY_KEY, JSON.stringify(next)) } catch { /* preference is best-effort */ }
+  }
+  const onPointerDown = (event: React.PointerEvent<HTMLDivElement>): void => {
+    const rect = event.currentTarget.parentElement?.getBoundingClientRect()
+    if (rect === undefined) return
+    drag.current = { dx: event.clientX - rect.left, dy: event.clientY - rect.top }
+    event.currentTarget.setPointerCapture(event.pointerId)
+  }
+  const onPointerMove = (event: React.PointerEvent<HTMLDivElement>): void => {
+    if (drag.current === undefined) return
+    const x = Math.min(Math.max(0, event.clientX - drag.current.dx), window.innerWidth - 120)
+    const y = Math.min(Math.max(0, event.clientY - drag.current.dy), window.innerHeight - 40)
+    setPos({ x, y })
+  }
+  const onPointerUp = (event: React.PointerEvent<HTMLDivElement>): void => {
+    if (drag.current === undefined) return
+    drag.current = undefined
+    event.currentTarget.releasePointerCapture(event.pointerId)
+    setPos((current) => { persist(current); return current })
+  }
+  const toggleCollapsed = (): void => {
+    setCollapsed((was) => {
+      const next = !was
+      try { window.localStorage.setItem(OVERLAY_COLLAPSED_KEY, next ? '1' : '0') } catch { /* best-effort */ }
+      return next
+    })
+  }
+
+  const place = pos === undefined ? { right: 16, top: 64 } : { left: pos.x, top: pos.y }
 
   return (
     <div
       style={{
         position: 'fixed',
-        right: 16,
-        bottom: 16,
+        ...place,
         zIndex: 2147483000,
         maxWidth: 320,
         background: C.warn,
         border: `1px solid ${C.warnBorder}`,
         color: C.warnText,
         borderRadius: 8,
-        padding: '10px 12px',
         fontSize: 12,
         boxShadow: '0 6px 24px rgba(0,0,0,0.45)',
+        userSelect: 'none',
       }}
     >
-      <div style={{ fontWeight: 700, marginBottom: 4 }}>⚠ Machine control is active</div>
-      {dangerous.map(server => (
-        <div key={server.id} style={{ display: 'flex', gap: 6, alignItems: 'baseline' }}>
-          <span style={{ color: C.danger }}>●</span>
-          <span>
-            <strong>{server.title}</strong>
-            {' — '}
-            {server.controlTools.length} control tool{server.controlTools.length === 1 ? '' : 's'} enabled
-          </span>
-        </div>
-      ))}
-      <div style={{ marginTop: 6, opacity: 0.85 }}>
-        Settings → Plugins → Toolbox to switch it off.
+      <div
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerCancel={onPointerUp}
+        style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 8px', cursor: 'move', borderBottom: collapsed ? 'none' : `1px solid ${C.warnBorder}` }}
+        title="drag to move"
+      >
+        <span style={{ fontWeight: 700 }}>⚠ Machine control is active</span>
+        <span style={{ flex: 1 }} />
+        <button
+          type="button"
+          onClick={toggleCollapsed}
+          title={collapsed ? 'expand' : 'collapse'}
+          style={{ background: 'transparent', border: `1px solid ${C.warnBorder}`, color: C.warnText, borderRadius: 4, cursor: 'pointer', fontSize: 11, lineHeight: '14px', padding: '0 5px' }}
+        >
+          {collapsed ? '+' : '–'}
+        </button>
       </div>
+      {!collapsed && (
+        <div style={{ padding: '8px 10px' }}>
+          {dangerous.map(server => (
+            <div key={server.id} style={{ display: 'flex', gap: 6, alignItems: 'baseline' }}>
+              <span style={{ color: C.danger }}>●</span>
+              <span>
+                <strong>{server.title}</strong>
+                {' — '}
+                {server.controlTools.length} control tool{server.controlTools.length === 1 ? '' : 's'} enabled
+              </span>
+            </div>
+          ))}
+          <div style={{ marginTop: 6, opacity: 0.85 }}>
+            Settings → Plugins → Toolbox to switch it off.
+          </div>
+        </div>
+      )}
     </div>
   )
 }

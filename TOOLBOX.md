@@ -40,7 +40,11 @@ the DSH profile, and regenerates the profile patch. It is idempotent.
 - **CLI:** `D:\deepseekHarnes\mcp\mcp.cmd` opens a menu; `mcp.ps1 help` lists
   commands (`list`, `status`, `on`, `off`, `hide`, `show`, `probe`, `patch`,
   `setup`).
-- **Chat:** `hello-toolbox` is an example skill; ask for a "toolbox check".
+- **Chat:** ``hello-toolbox`` is an example skill; ask for a "toolbox check".
+- **Agent:** the model-facing ``toolbox`` tool runs the same operations -
+  ``status``, ``setup``, ``server_enable``, ``server_disable``, ``tool_enable``,
+  ``tool_disable``, ``provider_enable``, ``provider_disable``, ``skill_enable``,
+  ``skill_disable`` - so an agent can install and switch this setup itself.
 
 ## What each switch actually does
 
@@ -81,6 +85,9 @@ Two opt-in examples exist so the plumbing can be checked end to end:
 
 A panel that switches capabilities off is only useful if the dangerous ones are
 visible and off by default. MCP servers that advertise machine-controlling tools
-are labelled `controls PC`, the floating overlay stays visible while any of them
+are labelled `controls PC`, and the overlay stays visible while any of them
+is enabled. The overlay is a draggable HUD: it defaults to the top-right so it never
+blocks the composer's send button, remembers where you drag it, and collapses to
+a small pill.
 is enabled, and the toolbox manager can disable any server from the command line
 if the GUI is unavailable.

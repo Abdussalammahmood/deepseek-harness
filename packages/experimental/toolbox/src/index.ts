@@ -18,6 +18,7 @@
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
+import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-settings'
@@ -550,6 +551,164 @@ function applySkills(skills: readonly ToolboxSkill[], log: (message: string) => 
  * @param ctx - host plugin context.
  * @param config - composition config; its published lists are replaced by live discovery.
  */
+/** Arguments of one `toolbox` tool call. */
+interface ToolActionArgs {
+  action: string
+  target?: string
+  tools?: string
+}
+
+/** Read one manifest, mutate it, and write it back. */
+function mutateManifest(id: string, mutate: (manifest: Manifest) => void): void {
+  const path = manifestPathById.get(id)
+  if (path === undefined) {
+    throw new Error(`unknown MCP server "${id}"; known: ${[...manifestPathById.keys()].join(', ') || '(none)'}`)
+  }
+  const manifest = JSON.parse(readFileSync(path, 'utf8')) as Manifest
+  mutate(manifest)
+  writeFileSync(path, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8')
+}
+
+/**
+ * Human-readable toolbox state.
+ * @param ctx - host plugin context.
+ * @returns one line per server, provider, and skill.
+ */
+export async function toolboxStatus(ctx: Context): Promise<string> {
+  const servers = discover()
+  const groups = discoverToolGroups(ctx)
+  const skills = await discoverSkills(ctx)
+  const lines: string[] = [`MCP servers (${servers.length}):`]
+  for (const server of servers) {
+    const off = server.hiddenTools.length > 0 ? `, ${server.hiddenTools.length} tools off` : ''
+    const risk = server.risk === 'control' ? ' CONTROLS PC' : ''
+    lines.push(`  ${server.enabled ? 'on ' : 'OFF'} ${server.id} [${server.serverName}]${risk} - ${server.tools.length} tools${off}`)
+  }
+  lines.push(`Native tool providers (${groups.length}):`)
+  for (const group of groups) {
+    const entry = group.entryId === undefined ? '' : ` [${group.entryId}]`
+    lines.push(`  ${group.enabled ? 'on ' : 'OFF'} ${group.plugin}${entry} - ${group.tools.length} tools`)
+  }
+  lines.push(`Skills (${skills.length}):`)
+  for (const skill of skills) {
+    lines.push(`  ${skill.modelInvocable ? 'on ' : 'OFF'} ${skill.name} (${skill.source})${skill.switchable ? '' : ' read-only'}`)
+  }
+  return lines.join('\n')
+}
+
+/**
+ * Run the toolbox installer and return its tail.
+ * @returns the exit status plus the last lines of output.
+ */
+async function runToolboxSetup(): Promise<string> {
+  const script = join(toolboxRoot(), 'mcp.ps1')
+  return await new Promise<string>((resolve) => {
+    const child = spawn('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, 'setup'], { windowsHide: true })
+    let out = ''
+    child.stdout.on('data', (chunk: { toString: () => string }) => { out += chunk.toString() })
+    child.stderr.on('data', (chunk: { toString: () => string }) => { out += chunk.toString() })
+    child.on('error', (error: unknown) => { resolve(`toolbox setup failed to start: ${String(error)}`) })
+    child.on('close', (code: number | null) => {
+      const tail = out.trim().split('\n').slice(-25).join('\n')
+      resolve(`toolbox setup exited ${String(code)}\n${tail}`)
+    })
+  })
+}
+
+/**
+ * Execute one `toolbox` tool action.
+ * @param args - the action, its target, and any tool names.
+ * @param ctx - host plugin context.
+ * @returns a human-readable result.
+ */
+export async function runToolAction(args: ToolActionArgs, ctx: Context): Promise<string> {
+  const need = (): string => {
+    if (args.target === undefined || args.target === '') throw new Error(`action "${args.action}" needs a target`)
+    return args.target
+  }
+  switch (args.action) {
+    case 'status':
+      return await toolboxStatus(ctx)
+    case 'setup':
+      return await runToolboxSetup()
+    case 'server_enable':
+    case 'server_disable': {
+      const id = need()
+      mutateManifest(id, (manifest) => { manifest.enabled = args.action === 'server_enable' })
+      regeneratePatch(() => { /* the tool reports its own result */ })
+      return `${args.action === 'server_enable' ? 'enabled' : 'disabled'} MCP server ${id}`
+    }
+    case 'tool_enable':
+    case 'tool_disable': {
+      const names = (args.tools ?? '').split(',').map(name => name.trim()).filter(name => name !== '')
+      if (names.length === 0) throw new Error(`action "${args.action}" needs comma-separated tool names in "tools"`)
+      const id = need()
+      mutateManifest(id, (manifest) => {
+        const excluded = new Set(manifest.toolFilter?.excluded ?? [])
+        for (const name of names) {
+          if (args.action === 'tool_disable') excluded.add(name)
+          else excluded.delete(name)
+        }
+        if (manifest.toolFilter !== undefined) manifest.toolFilter.excluded = [...excluded]
+      })
+      regeneratePatch(() => { /* the tool reports its own result */ })
+      return `${args.action === 'tool_disable' ? 'hid' : 'restored'} ${names.join(', ')} on ${id}`
+    }
+    case 'provider_enable':
+    case 'provider_disable': {
+      const id = need()
+      const disabled = new Set(readPluginsDoc().disabledPlugins ?? [])
+      if (args.action === 'provider_disable') disabled.add(id)
+      else disabled.delete(id)
+      writeDisabledPlugins([...disabled])
+      regeneratePatch(() => { /* the tool reports its own result */ })
+      return `${args.action === 'provider_disable' ? 'disabled' : 'enabled'} tool provider ${id}`
+    }
+    case 'skill_enable':
+    case 'skill_disable': {
+      const name = need()
+      const skill = (await discoverSkills(ctx)).find(candidate => candidate.name === name)
+      if (skill === undefined) throw new Error(`no such skill "${name}"`)
+      if (!skill.switchable || skill.path === undefined) throw new Error(`skill "${name}" is read-only`)
+      setModelInvocable(skill.path, args.action === 'skill_enable')
+      return `${args.action === 'skill_enable' ? 'enabled' : 'disabled'} skill ${name}`
+    }
+    default:
+      throw new Error(`unknown action "${args.action}"`)
+  }
+}
+
+/**
+ * Register the model-facing `toolbox` tool.
+ * @param ctx - host plugin context.
+ */
+function registerTool(ctx: Context): void {
+  ctx.effect(() => ctx.tools.register(defineTool({
+    name: 'toolbox',
+    description: 'Inspect and change this machine\'s DeepSeek Harness toolbox: MCP servers, native tool providers, and installed skills. Start with action "status" to list ids, then enable or disable by id.',
+    parameters: {
+      action: {
+        type: 'string',
+        required: true,
+        description: 'status, setup, server_enable, server_disable, tool_enable, tool_disable, provider_enable, provider_disable, skill_enable, skill_disable',
+      },
+      target: { type: 'string', description: 'MCP server id, provider entry id, or skill name, depending on the action' },
+      tools: { type: 'string', description: 'Comma-separated MCP tool names, for tool_enable and tool_disable' },
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value) => [{ type: 'text', text: value }],
+    },
+    async execute(args) {
+      return await runToolAction({
+        action: args.action,
+        ...args.target === undefined ? {} : { target: args.target },
+        ...args.tools === undefined ? {} : { tools: args.tools },
+      }, ctx)
+    },
+  })))
+}
+
 export async function apply(ctx: Context, config: Config): Promise<void> {
   const servers = discover()
   const toolGroups = discoverToolGroups(ctx)
@@ -600,4 +759,5 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       },
     })
   })
+  registerTool(ctx)
 }
