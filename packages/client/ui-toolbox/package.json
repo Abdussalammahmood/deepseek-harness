@@ -1,6 +1,6 @@
 {
   "name": "@deepseek-ai/dsh-client-ui-toolbox",
-  "description": "Toolbox tab in Web Settings: lists installed MCP servers and their tools with on/off switches and a warning for machine-controlling capabilities",
+  "description": "Toolbox tab and machine-control warning overlay for the Web client: MCP servers, native tools, and skills with on/off switches",
   "version": "0.1.5-rc.1",
   "private": true,
   "type": "module",
@@ -22,7 +22,8 @@
     "client": {
       "inject": [
         "@deepseek-ai/dsh-client-ui-settings",
-        "@deepseek-ai/dsh-client-ui-slots"
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-layout"
       ],
       "platform": "web"
     }
@@ -37,6 +38,7 @@
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "workspace:^",
+    "@deepseek-ai/dsh-client-ui-layout": "workspace:^",
     "@deepseek-ai/dsh-client-ui-settings": "workspace:^",
     "@deepseek-ai/dsh-client-ui-slots": "workspace:^",
     "@deepseek-ai/dsh-client-ui-renderer": "workspace:^",

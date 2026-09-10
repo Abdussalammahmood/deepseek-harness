@@ -1,6 +1,6 @@
 {
   "name": "@deepseek-ai/dsh-toolbox",
-  "description": "Toolbox host half: owns the 'toolbox' settings namespace describing installed MCP servers and their tools, and applies changes back to the MCP toolbox manifests",
+  "description": "Toolbox host half: owns the 'toolbox' settings namespace describing installed MCP servers, native tools, and skills, and applies changes back to the MCP toolbox manifests",
   "version": "0.1.5-rc.1",
   "private": true,
   "type": "module",
@@ -20,11 +20,15 @@
   },
   "dependencies": {
     "@deepseek-ai/dsh-settings": "workspace:^",
+    "@deepseek-ai/dsh-skill": "workspace:^",
+    "@deepseek-ai/dsh-tools": "workspace:^",
     "@deepseek-ai/schemastery": "workspace:^"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "workspace:^",
     "@deepseek-ai/dsh-settings": "workspace:^",
+    "@deepseek-ai/dsh-skill": "workspace:^",
+    "@deepseek-ai/dsh-tools": "workspace:^",
     "@deepseek-ai/schemastery": "workspace:^"
   },
   "files": [

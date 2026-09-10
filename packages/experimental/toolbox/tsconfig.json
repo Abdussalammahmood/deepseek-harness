@@ -15,6 +15,12 @@
       "path": "../../settings/settings"
     },
     {
+      "path": "../../core/tools"
+    },
+    {
+      "path": "../../skill/skill"
+    },
+    {
       "path": "../../../vendor/schemastery"
     }
   ]

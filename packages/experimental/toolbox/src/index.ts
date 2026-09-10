@@ -1,13 +1,13 @@
 /**
  * Toolbox host half: owns the `toolbox` settings namespace that describes the
- * MCP servers installed by the DSH MCP toolbox, and writes the user's choices
- * back into that toolbox's own manifests.
+ * MCP servers, native tools, and skills this deployment offers, and writes the
+ * user's server/tool choices back into the MCP toolbox manifests.
  *
- * The toolbox folder stays the single source of truth. This plugin reads the
- * manifests to publish their servers, tools, and descriptions to the browser
- * UI, and on a settings change it updates the same manifests and asks the
- * toolbox manager (`mcp.ps1 patch`) to regenerate the DSH profile patch, so the
- * profile reloads live and no second patch writer exists.
+ * The toolbox folder stays the single source of truth for MCP servers. This
+ * plugin reads the manifests to publish their servers, tools, and descriptions
+ * to the browser UI, and on a settings change it updates the same manifests and
+ * asks the toolbox manager (`mcp.ps1 patch`) to regenerate the DSH profile
+ * patch, so the profile reloads live and no second patch writer exists.
  *
  * @module @deepseek-ai/dsh-toolbox
  */
@@ -18,11 +18,13 @@ import { spawn } from 'node:child_process'
 import z from '@deepseek-ai/schemastery'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-settings'
+import type {} from '@deepseek-ai/dsh-tools'
+import type {} from '@deepseek-ai/dsh-skill'
 
 export const name = 'toolbox'
 export const inject = ['settings']
 
-/** Settings namespace this plugin owns; the browser card keys on the same string. */
+/** Settings namespace this plugin owns; the browser tab keys on the same string. */
 export const NS = 'toolbox'
 
 /**
@@ -56,10 +58,34 @@ export interface ToolboxServer {
   hiddenTools: string[]
 }
 
+/** One native (non-MCP) model-facing tool. */
+export interface ToolboxTool {
+  /** Model-visible tool name. */
+  name: string
+  /** Description the model sees. */
+  description: string
+}
+
+/** One installed skill. */
+export interface ToolboxSkill {
+  /** Kebab-case skill id. */
+  name: string
+  /** Routing description. */
+  description: string
+  /** Discovery source that produced the winning skill. */
+  source: string
+  /** Provider that owns the skill body. */
+  provider: string
+}
+
 /** Plugin config, doubling as the `toolbox` settings-section shape. */
 export interface Config {
-  /** Published servers, defaulted from the toolbox manifests. */
+  /** Published MCP servers, defaulted from the toolbox manifests. */
   servers: ToolboxServer[]
+  /** Native model-facing tools, defaulted from the live tool registry. */
+  nativeTools: ToolboxTool[]
+  /** Installed skills, defaulted from the live skill registry. */
+  skills: ToolboxSkill[]
 }
 
 const serverSchema = z.object({
@@ -74,8 +100,22 @@ const serverSchema = z.object({
   hiddenTools: z.array(z.string()).default([]),
 })
 
+const toolSchema = z.object({
+  name: z.string().required(),
+  description: z.string().default(''),
+})
+
+const skillSchema = z.object({
+  name: z.string().required(),
+  description: z.string().default(''),
+  source: z.string().default(''),
+  provider: z.string().default(''),
+})
+
 export const Config: z<Config> = z.object({
   servers: z.array(serverSchema).default([]),
+  nativeTools: z.array(toolSchema).default([]),
+  skills: z.array(skillSchema).default([]),
 })
 
 /** The subset of a toolbox manifest this plugin reads and writes. */
@@ -137,6 +177,60 @@ export function discover(): ToolboxServer[] {
   return servers
 }
 
+/** The registry surface this plugin reads. */
+interface ToolSchemas {
+  schemas: () => readonly { name: string; description?: string }[]
+}
+
+/**
+ * Every model-facing tool the registry currently exposes, minus the MCP-bridged
+ * ones (those belong to their own server entry).
+ * @param ctx - host plugin context.
+ * @returns native tools in registry order, or an empty list without the service.
+ */
+export function discoverTools(ctx: Context): ToolboxTool[] {
+  const tools = ctx.get('tools') as unknown as ToolSchemas | undefined
+  if (tools === undefined || typeof tools.schemas !== 'function') return []
+  try {
+    return tools.schemas()
+      .filter(schema => !schema.name.startsWith('mcp__'))
+      .map(schema => ({ name: schema.name, description: schema.description ?? '' }))
+  } catch {
+    return []
+  }
+}
+
+/** The skill registry surface this plugin reads. */
+interface SkillListable {
+  list: (options?: object) => Promise<readonly {
+    name: string
+    description: string
+    source?: string
+    provider?: string
+  }[]>
+}
+
+/**
+ * Every installed skill.
+ * @param ctx - host plugin context.
+ * @returns skills in registry order, or an empty list without the service.
+ */
+export async function discoverSkills(ctx: Context): Promise<ToolboxSkill[]> {
+  const skills = ctx.get('skills') as unknown as SkillListable | undefined
+  if (skills === undefined || typeof skills.list !== 'function') return []
+  try {
+    const listed = await skills.list({})
+    return listed.map(skill => ({
+      name: skill.name,
+      description: skill.description,
+      source: skill.source ?? '',
+      provider: skill.provider ?? '',
+    }))
+  } catch {
+    return []
+  }
+}
+
 /** Comparable form of the fields this plugin owns, for change detection. */
 function signature(servers: readonly ToolboxServer[]): string {
   return JSON.stringify(servers
@@ -176,15 +270,23 @@ function applyToManifests(servers: readonly ToolboxServer[], log: (message: stri
 /**
  * Register the `toolbox` settings namespace.
  * @param ctx - host plugin context.
- * @param config - composition config; its `servers` default is replaced by the live manifest scan.
+ * @param config - composition config; its published lists are replaced by live discovery.
  */
-export function apply(ctx: Context, config: Config): void {
+export async function apply(ctx: Context, config: Config): Promise<void> {
   const discovered = discover()
+  const nativeTools = discoverTools(ctx)
+  const skills = await discoverSkills(ctx)
+  const defaults: Config = { servers: discovered, nativeTools, skills }
   let applied = signature(discovered)
-  let current: () => Config = () => ({ servers: discovered })
+  let current: () => Config = () => defaults
 
   ctx.inject(['settings'], (settingsCtx) => {
-    settingsCtx.settings.installSection(ctx, NS, Config, { ...config, servers: discovered }, {
+    const composition: Config = {
+      servers: defaults.servers.length > 0 ? defaults.servers : config.servers,
+      nativeTools: defaults.nativeTools,
+      skills: defaults.skills,
+    }
+    settingsCtx.settings.installSection(ctx, NS, Config, composition, {
       setSource: (source) => {
         current = source
       },
@@ -194,7 +296,7 @@ export function apply(ctx: Context, config: Config): void {
         if (next === applied) return
         applied = next
         try {
-          applyToManifests(servers, message => ctx.logger.info(message))
+          applyToManifests(servers, (message) => { ctx.logger.info(message) })
         } catch (error) {
           ctx.logger.error(`toolbox: failed to apply settings: ${String(error)}`)
         }
