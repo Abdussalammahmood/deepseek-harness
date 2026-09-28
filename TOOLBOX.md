@@ -110,5 +110,8 @@ Only your API key is not in git; add it once in Settings then Models.
 
 Sessions are stored per workspace under `%DSH_HOME%\sessions\`, indexed by
 `%DSH_HOME%\storages\workspace.json` (workspace id, path, title, session ids).
-A private git backup of that store, plus a daily scheduled task, is set up by the
-companion repo: see its README section "Where your conversations live".
+This branch also ships a **Cloud Sync** plugin (`packages/experimental/cloud-sync`
++ `packages/client/ui-cloud-sync`) that mirrors that store into a local
+OneDrive/Google Drive folder — see **Settings → Plugins → Cloud Sync** and the
+companion repo README. The cloud app's own client does the upload, so the plugin
+stores no credentials.

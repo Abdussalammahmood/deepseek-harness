@@ -326,6 +326,7 @@
     { "path": "./packages/experimental/tool-agent-team" },
     { "path": "./packages/experimental/agent-team-web-profile" },
     { "path": "./packages/experimental/toolbox" },
+    { "path": "./packages/experimental/cloud-sync" },
     { "path": "./packages/workflow/workflow" },
     { "path": "./packages/workflow/workflow-worker-thread" },
     { "path": "./packages/workflow/tool-workflow" },

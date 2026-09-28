@@ -348,6 +348,15 @@
     - id: ui-trajectory
       name: '@deepseek-ai/dsh-client-ui-trajectory'
 
+    # Cloud-sync: mirror the harness home into a local OneDrive/Google Drive
+    # folder. The row loads but does nothing until the plugin's own `enabled`
+    # setting is switched on, so it only appears in Settings → Plugins by default.
+    - id: cloud-sync
+      name: '@deepseek-ai/dsh-cloud-sync'
+
+    - id: ui-cloud-sync
+      name: '@deepseek-ai/dsh-client-ui-cloud-sync'
+
 # ── the agent plane moves behind agent presets ─────────────────────────────
 #
 # Every row below composes what ONE agent contributes to the host registries:
